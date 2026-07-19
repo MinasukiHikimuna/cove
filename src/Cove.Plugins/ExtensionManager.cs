@@ -15,7 +15,7 @@ namespace Cove.Plugins;
 /// Manages extension discovery, loading, dependency resolution, lifecycle,
 /// migrations, and capability wiring. This is the heart of the Cove extension system.
 /// </summary>
-public class ExtensionManager
+public class ExtensionManager : IExtensionEntityFilterRuntime
 {
     private readonly object _extensionRegistryGate = new();
     private readonly object _extensionSetMutationGate = new();
@@ -1733,7 +1733,16 @@ public class ExtensionManager
             manifest.DialogOverrides.AddRange(extManifest.DialogOverrides.Select(dialogOverride => dialogOverride with { ExtensionId = ext.Id }));
             manifest.Actions.AddRange(extManifest.Actions.Select(action => action with { ExtensionId = ext.Id }));
             AddTutorialTopics(extManifest.TutorialTopics, ext.Id);
-            manifest.ListFilters.AddRange(extManifest.ListFilters.Select(filter => filter with { ExtensionId = ext.Id }));
+            manifest.ListFilters.AddRange(extManifest.ListFilters
+                .Where(filter => string.IsNullOrWhiteSpace(filter.FilterId) || IsSupportedExecutableFilterEntity(filter.EntityType))
+                .Select(filter => string.IsNullOrWhiteSpace(filter.FilterId)
+                    ? filter with { ExtensionId = ext.Id }
+                    : filter with
+                    {
+                        ExtensionId = ext.Id,
+                        EntityType = "tags",
+                        FilterId = filter.FilterId.Trim(),
+                    }));
             manifest.ListSorts.AddRange(extManifest.ListSorts.Select(sort => sort with { ExtensionId = ext.Id }));
         }
 
@@ -1780,6 +1789,182 @@ public class ExtensionManager
         manifest.ListFilters.Sort((a, b) => a.Order.CompareTo(b.Order));
         manifest.ListSorts.Sort((a, b) => a.Order.CompareTo(b.Order));
         return manifest;
+    }
+
+    private static bool IsSupportedExecutableFilterEntity(string entityType)
+        => string.Equals(entityType?.Trim(), "tags", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Capture one declaration and provider generation for every batch of a criterion. The returned
+    /// execution owns an extension scope whose generation remains alive through replacement or
+    /// disable, and defers scope disposal while timed-out provider work is still running.
+    /// </summary>
+    public async Task<IExtensionEntityFilterExecution?> OpenEntityFilterAsync(
+        string extensionId,
+        string entityType,
+        string filterId,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(extensionId)
+            || string.IsNullOrWhiteSpace(entityType)
+            || string.IsNullOrWhiteSpace(filterId)
+            || !IsSupportedExecutableFilterEntity(entityType))
+            return null;
+
+        var lifecycleGate = GetExtensionLifecycleGate(extensionId);
+        await lifecycleGate.WaitAsync(ct);
+        var releaseLifecycleGate = true;
+        IServiceScope? provisionalScope = null;
+        try
+        {
+            if (!IsEnabled(extensionId)
+                || !IsExtensionInitialized(extensionId)
+                || GetExtension(extensionId) is not { } extension
+                || extension is not IUIExtension uiExtension)
+                return null;
+
+            var declaration = ExecuteExtension(extension, uiExtension.GetUIManifest).ListFilters
+                .Where(filter => !string.IsNullOrWhiteSpace(filter.FilterId))
+                .FirstOrDefault(filter =>
+                    string.Equals(filter.EntityType.Trim(), entityType.Trim(), StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(filter.FilterId!.Trim(), filterId.Trim(), StringComparison.OrdinalIgnoreCase));
+            if (declaration is null)
+                return null;
+
+            provisionalScope = CreateExtensionScope(extension);
+            var provider = provisionalScope.ServiceProvider.GetServices<IExtensionEntityFilterProvider>()
+                .SingleOrDefault(candidate => candidate.Filters.Any(definition =>
+                    string.Equals(definition.FilterId.Trim(), filterId.Trim(), StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(definition.EntityType.Trim(), entityType.Trim(), StringComparison.OrdinalIgnoreCase)));
+            if (provider is null)
+                return null;
+
+            var ownedDeclaration = declaration with
+            {
+                ExtensionId = extension.Id,
+                EntityType = "tags",
+                FilterId = declaration.FilterId!.Trim(),
+            };
+            var ownedScope = provisionalScope;
+            provisionalScope = null;
+            releaseLifecycleGate = false;
+            return new ExtensionEntityFilterExecution(
+                ownedDeclaration,
+                provider,
+                ownedScope,
+                () => lifecycleGate.Release());
+        }
+        finally
+        {
+            try
+            {
+                provisionalScope?.Dispose();
+            }
+            finally
+            {
+                if (releaseLifecycleGate)
+                    lifecycleGate.Release();
+            }
+        }
+    }
+
+    private sealed class ExtensionEntityFilterExecution(
+        UIListFilterContribution declaration,
+        IExtensionEntityFilterProvider provider,
+        IServiceScope scope,
+        Action releaseLifecycleGate) : IExtensionEntityFilterExecution
+    {
+        private readonly object _gate = new();
+        private IServiceScope? _scope = scope;
+        private int _activeCalls;
+        private bool _disposeRequested;
+
+        public UIListFilterContribution Declaration { get; } = declaration;
+
+        public Task<ExtensionEntityFilterResult> ResolveAsync(
+            ExtensionEntityFilterRequest request,
+            CancellationToken ct)
+        {
+            lock (_gate)
+            {
+                ObjectDisposedException.ThrowIf(_disposeRequested, this);
+                _activeCalls++;
+            }
+
+            Task<ExtensionEntityFilterResult> task;
+            try
+            {
+                task = provider.ResolveAsync(request, ct);
+            }
+            catch
+            {
+                ReleaseCall();
+                throw;
+            }
+
+            return AwaitAndReleaseAsync(task);
+        }
+
+        public void Dispose()
+        {
+            IServiceScope? dispose = null;
+            lock (_gate)
+            {
+                if (_disposeRequested)
+                    return;
+
+                _disposeRequested = true;
+                if (_activeCalls == 0)
+                {
+                    dispose = _scope;
+                    _scope = null;
+                }
+            }
+            ReleaseResources(dispose);
+        }
+
+        private async Task<ExtensionEntityFilterResult> AwaitAndReleaseAsync(
+            Task<ExtensionEntityFilterResult> task)
+        {
+            try
+            {
+                return await task;
+            }
+            finally
+            {
+                ReleaseCall();
+            }
+        }
+
+        private void ReleaseCall()
+        {
+            IServiceScope? dispose = null;
+            lock (_gate)
+            {
+                _activeCalls--;
+                if (_activeCalls == 0 && _disposeRequested)
+                {
+                    dispose = _scope;
+                    _scope = null;
+                }
+            }
+            ReleaseResources(dispose);
+        }
+
+        private void ReleaseResources(IServiceScope? dispose)
+        {
+            if (dispose is null)
+                return;
+
+            try
+            {
+                dispose.Dispose();
+            }
+            finally
+            {
+                releaseLifecycleGate();
+            }
+        }
     }
 
     /// <summary>Get enabled extension UI JS bundle asset paths (extensionId + relative path).</summary>

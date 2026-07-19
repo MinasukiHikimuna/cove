@@ -344,6 +344,54 @@ public class UIManifestBuilder
         return this;
     }
 
+    /// <summary>
+    /// Add a first-class advanced filter resolved by this extension's backend provider. Executable
+    /// extension filters are initially supported only on the Tags list.
+    /// </summary>
+    public UIManifestBuilder AddExtensionListFilter(
+        string entityType,
+        string id,
+        string label,
+        string criterionType,
+        string filterId,
+        int order = 100,
+        IEnumerable<string>? modifiers = null,
+        IEnumerable<UIListFilterOption>? options = null)
+    {
+        if (string.IsNullOrWhiteSpace(entityType)
+            || !string.Equals(entityType.Trim(), "tags", StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Executable extension filters are currently supported only for the 'tags' entity type.", nameof(entityType));
+        if (string.IsNullOrWhiteSpace(id))
+            throw new ArgumentException("Executable extension filter ID is required.", nameof(id));
+        if (string.IsNullOrWhiteSpace(label))
+            throw new ArgumentException("Executable extension filter label is required.", nameof(label));
+        if (string.IsNullOrWhiteSpace(criterionType))
+            throw new ArgumentException("Executable extension filter criterion type is required.", nameof(criterionType));
+        if (string.IsNullOrWhiteSpace(filterId))
+            throw new ArgumentException("Executable extension backend filter ID is required.", nameof(filterId));
+
+        var normalizedModifiers = modifiers?
+            .Select(modifier => modifier?.Trim())
+            .Where(modifier => !string.IsNullOrWhiteSpace(modifier))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Select(modifier => modifier!)
+            .ToList();
+
+        _manifest.ListFilters.Add(new UIListFilterContribution(
+            id.Trim(),
+            "tags",
+            label.Trim(),
+            criterionType.Trim().ToLowerInvariant(),
+            _extensionId,
+            Modifiers: normalizedModifiers,
+            Options: options?.ToList(),
+            Order: order)
+        {
+            FilterId = filterId.Trim(),
+        });
+        return this;
+    }
+
     /// <summary>Add a first-class sort option backed by an existing backend sort key.</summary>
     public UIManifestBuilder AddListSort(
         string entityType,

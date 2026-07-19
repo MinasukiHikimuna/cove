@@ -141,6 +141,62 @@ public interface IUIExtension : IExtension
 }
 
 /// <summary>
+/// Resolves extension-owned predicates against host-authorized entity candidates. Providers return
+/// only membership; Cove retains ownership of authorization, query composition, sorting and paging.
+/// Resolve callbacks must not invoke or await a lifecycle transition for their own extension because
+/// the host retains that lifecycle gate while pinning one declaration and provider generation across
+/// every batch of the criterion.
+/// </summary>
+public interface IExtensionEntityFilterProvider
+{
+    IReadOnlyCollection<ExtensionEntityFilterDefinition> Filters { get; }
+    Task<ExtensionEntityFilterResult> ResolveAsync(ExtensionEntityFilterRequest request, CancellationToken ct);
+}
+
+public sealed record ExtensionEntityFilterDefinition(string FilterId, string EntityType);
+
+public sealed record ExtensionFilterPrincipal(
+    int? UserId,
+    string Username,
+    string Kind,
+    IReadOnlyCollection<string> Roles,
+    IReadOnlyCollection<string> Permissions);
+
+public sealed record ExtensionEntityFilterRequest(
+    string ExtensionId,
+    string EntityType,
+    string FilterId,
+    string Modifier,
+    System.Text.Json.JsonElement Value,
+    IReadOnlyList<int> CandidateIds,
+    ExtensionFilterPrincipal Principal);
+
+public sealed record ExtensionEntityFilterResult(
+    IReadOnlyCollection<int> MatchingEntityIds,
+    string Revision);
+
+/// <summary>
+/// One owner-stamped filter declaration and exact provider generation captured for a criterion.
+/// Dispose the execution after all batches have been scheduled; implementations retain their
+/// provider scope until any timed-out in-flight work actually completes.
+/// </summary>
+public interface IExtensionEntityFilterExecution : IDisposable
+{
+    UIListFilterContribution Declaration { get; }
+    Task<ExtensionEntityFilterResult> ResolveAsync(ExtensionEntityFilterRequest request, CancellationToken ct);
+}
+
+/// <summary>Host runtime used by the query orchestrator. Contributions are always owner-stamped.</summary>
+public interface IExtensionEntityFilterRuntime
+{
+    Task<IExtensionEntityFilterExecution?> OpenEntityFilterAsync(
+        string extensionId,
+        string entityType,
+        string filterId,
+        CancellationToken ct);
+}
+
+/// <summary>
 /// Extension with persistent key-value storage backed by the Cove database.
 /// The ExtensionManager provides the IExtensionStore implementation.
 /// </summary>
@@ -791,8 +847,15 @@ public record UIListFilterContribution(
     string? EntityReferenceType = null,
     List<string>? Modifiers = null,
     List<UIListFilterOption>? Options = null,
-    int Order = 100
-);
+    int Order = 100)
+{
+    /// <summary>
+    /// Stable provider-owned filter identifier. Null means presentation-only/core-backed. This is
+    /// an init property so extensions compiled against the original positional record keep the
+    /// same constructor and deconstructor ABI.
+    /// </summary>
+    public string? FilterId { get; init; }
+}
 
 /// <summary>Static option for an extension-contributed enum/multi-select list filter.</summary>
 public record UIListFilterOption(string Value, string Label);
