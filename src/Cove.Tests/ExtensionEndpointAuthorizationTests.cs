@@ -566,7 +566,7 @@ public sealed class ExtensionEndpointAuthorizationMiddlewareTests
                 extensionScope.ServiceProvider.GetRequiredService<IAuditService>());
         }
 
-        ExtensionEndpointPipeline.Configure(app, overlay.CreateScope);
+        ExtensionEndpointPipeline.Configure(app, endpoint => overlay.CreateScope(endpoint.ExtensionId));
         app.MapGet("/extension-security/{tagId:int}", () => Results.Ok())
             .RequireCovePermission(Permissions.TagsRead)
             .RequireCoveEntityAccess(EntityKinds.Tag, "tagId", Permissions.TagsRead)
