@@ -345,8 +345,7 @@ public class UIManifestBuilder
     }
 
     /// <summary>
-    /// Add a first-class advanced filter resolved by this extension's backend provider. Executable
-    /// extension filters are initially supported only on the Tags list.
+    /// Add a first-class advanced filter resolved by this extension's backend provider.
     /// </summary>
     public UIManifestBuilder AddExtensionListFilter(
         string entityType,
@@ -358,9 +357,8 @@ public class UIManifestBuilder
         IEnumerable<string>? modifiers = null,
         IEnumerable<UIListFilterOption>? options = null)
     {
-        if (string.IsNullOrWhiteSpace(entityType)
-            || !string.Equals(entityType.Trim(), "tags", StringComparison.OrdinalIgnoreCase))
-            throw new ArgumentException("Executable extension filters are currently supported only for the 'tags' entity type.", nameof(entityType));
+        if (string.IsNullOrWhiteSpace(entityType))
+            throw new ArgumentException("Executable extension filter entity type is required.", nameof(entityType));
         if (string.IsNullOrWhiteSpace(id))
             throw new ArgumentException("Executable extension filter ID is required.", nameof(id));
         if (string.IsNullOrWhiteSpace(label))
@@ -379,7 +377,7 @@ public class UIManifestBuilder
 
         _manifest.ListFilters.Add(new UIListFilterContribution(
             id.Trim(),
-            "tags",
+            entityType.Trim().ToLowerInvariant(),
             label.Trim(),
             criterionType.Trim().ToLowerInvariant(),
             _extensionId,

@@ -26,6 +26,8 @@ public class TagsController(
     ExtensionEntityFilterService? extensionFilters = null,
     ICurrentPrincipalAccessor? principalAccessor = null) : ControllerBase
 {
+    private const int ExtensionFilterCandidateLimit = 5_000;
+
     private sealed record TagUsageCounts(
         int VideoCount,
         int SegmentCount,
@@ -109,10 +111,10 @@ public class TagsController(
 
             try
             {
-                var candidateFindFilter = CopyFindFilter(findFilter, page: 1, perPage: ExtensionEntityFilterService.DefaultCandidateLimit + 1);
+                var candidateFindFilter = CopyFindFilter(findFilter, page: 1, perPage: ExtensionFilterCandidateLimit + 1);
                 var (candidateItems, coreCount) = await tagRepo.FindAsync(filter, candidateFindFilter, ct);
-                if (coreCount > ExtensionEntityFilterService.DefaultCandidateLimit)
-                    throw new ExtensionEntityFilterLimitException($"Extension filtering supports at most {ExtensionEntityFilterService.DefaultCandidateLimit} core candidates per query.");
+                if (coreCount > ExtensionFilterCandidateLimit)
+                    throw new ExtensionEntityFilterLimitException($"Extension filtering supports at most {ExtensionFilterCandidateLimit} core candidates per query.");
 
                 var candidateIds = candidateItems.Select(tag => tag.Id).ToArray();
                 var authorizedQuery = await ReadScopeListOptimization.ApplyAsync<Tag>(db, EntityKinds.Tag, Permissions.TagsRead, ct);
@@ -196,7 +198,7 @@ public class TagsController(
             var candidateFindFilter = CopyFindFilter(
                 graphFindFilter,
                 page: 1,
-                perPage: ExtensionEntityFilterService.DefaultCandidateLimit + 1);
+                perPage: ExtensionFilterCandidateLimit + 1);
             (items, totalCount) = await tagRepo.FindAsync(filter, candidateFindFilter, ct);
         }
 
@@ -206,8 +208,8 @@ public class TagsController(
                 return StatusCode(StatusCodes.Status503ServiceUnavailable, new ProblemDetails { Title = "Extension filtering is unavailable." });
             try
             {
-                if (totalCount > ExtensionEntityFilterService.DefaultCandidateLimit)
-                    throw new ExtensionEntityFilterLimitException($"Extension filtering supports at most {ExtensionEntityFilterService.DefaultCandidateLimit} core candidates per query.");
+                if (totalCount > ExtensionFilterCandidateLimit)
+                    throw new ExtensionEntityFilterLimitException($"Extension filtering supports at most {ExtensionFilterCandidateLimit} core candidates per query.");
                 var candidateIds = items.Select(tag => tag.Id).ToArray();
                 var authorizedQuery = await ReadScopeListOptimization.ApplyAsync<Tag>(db, EntityKinds.Tag, Permissions.TagsRead, ct);
                 var authorizedIds = await authorizedQuery

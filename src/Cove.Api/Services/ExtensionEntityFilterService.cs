@@ -13,28 +13,26 @@ namespace Cove.Api.Services;
 /// </summary>
 public sealed class ExtensionEntityFilterService
 {
-    public const int DefaultCandidateLimit = 5_000;
-    public const int DefaultBatchSize = 256;
+    public const int DefaultBatchSize = ExtensionContributionBatchExecutor.DefaultBatchSize;
     public const int DefaultCriteriaLimit = 16;
     public const int DefaultIdentifierLengthLimit = 256;
     public const int DefaultModifierLengthLimit = 64;
     public const int DefaultValueLengthLimit = 4_096;
-    public static readonly TimeSpan DefaultProviderTimeout = TimeSpan.FromSeconds(2);
+    public static readonly TimeSpan DefaultProviderTimeout = ExtensionContributionBatchExecutor.DefaultTimeout;
 
     private readonly IExtensionEntityFilterRuntime _runtime;
-    private readonly int _batchSize;
-    private readonly int _candidateLimit;
+    private readonly ExtensionContributionBatchExecutor _batchExecutor;
     private readonly TimeSpan _providerTimeout;
 
     public ExtensionEntityFilterService(
         IExtensionEntityFilterRuntime runtime,
         int batchSize = DefaultBatchSize,
-        int candidateLimit = DefaultCandidateLimit,
         TimeSpan? providerTimeout = null)
     {
         _runtime = runtime;
-        _batchSize = Math.Clamp(batchSize, 1, DefaultCandidateLimit);
-        _candidateLimit = Math.Clamp(candidateLimit, 1, DefaultCandidateLimit);
+        _batchExecutor = new ExtensionContributionBatchExecutor(
+            batchSize,
+            DefaultIdentifierLengthLimit);
         _providerTimeout = providerTimeout ?? DefaultProviderTimeout;
     }
 
@@ -49,9 +47,6 @@ public sealed class ExtensionEntityFilterService
             return orderedCandidateIds;
         if (criteria.Count > DefaultCriteriaLimit)
             throw new ExtensionEntityFilterLimitException($"Extension filtering supports at most {DefaultCriteriaLimit} criteria per query.");
-        if (orderedCandidateIds.Count > _candidateLimit)
-            throw new ExtensionEntityFilterLimitException($"Extension filtering supports at most {_candidateLimit} candidates per query.");
-
         var candidates = orderedCandidateIds.Distinct().ToList();
         var principalContext = new ExtensionFilterPrincipal(
             principal.UserId,
@@ -123,76 +118,55 @@ public sealed class ExtensionEntityFilterService
         long queryStartedAt,
         CancellationToken ct)
     {
-        var nextMatches = new HashSet<int>();
-        var revisionInitialized = false;
-        string? criterionRevision = null;
+        var remaining = _providerTimeout - Stopwatch.GetElapsedTime(queryStartedAt);
+        if (remaining <= TimeSpan.Zero)
+            throw new ExtensionEntityFilterProviderException("The extension filter provider timed out.");
 
-        foreach (var batch in candidates.Chunk(_batchSize))
+        IReadOnlyList<ExtensionEntityFilterResult> results;
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            var remaining = _providerTimeout - Stopwatch.GetElapsedTime(queryStartedAt);
-            if (remaining <= TimeSpan.Zero)
-                throw new ExtensionEntityFilterProviderException("The extension filter provider timed out.");
-
-            var request = new ExtensionEntityFilterRequest(
-                declaration.ExtensionId,
-                NormalizeEntityType(declaration.EntityType),
-                declaration.FilterId!,
-                NormalizeModifier(criterion.Modifier),
-                criterion.Value,
-                batch,
-                principalContext);
-            ExtensionEntityFilterResult result;
-            Task<ExtensionEntityFilterResult>? providerTask = null;
-            try
-            {
-                providerTask = execution.ResolveAsync(request, queryDeadline.Token);
-                result = await providerTask.WaitAsync(remaining, ct);
-            }
-            catch (TimeoutException)
-            {
-                queryDeadline.Cancel();
-                ObserveLateProviderFailure(providerTask);
-                throw new ExtensionEntityFilterProviderException("The extension filter provider timed out.");
-            }
-            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-            {
-                ObserveLateProviderFailure(providerTask);
-                throw new ExtensionEntityFilterProviderException("The extension filter provider timed out.");
-            }
-            catch (OperationCanceledException)
-            {
-                ObserveLateProviderFailure(providerTask);
-                throw;
-            }
-            catch (Exception ex)
-            {
-                throw new ExtensionEntityFilterProviderException("The extension filter provider failed.", ex);
-            }
-
-            if (result?.MatchingEntityIds is null
-                || result.MatchingEntityIds.Count > batch.Length
-                || result.MatchingEntityIds.Any(id => !batch.Contains(id)))
-            {
-                throw new ExtensionEntityFilterProviderException("The extension filter provider returned an invalid or oversized membership result.");
-            }
-            if (string.IsNullOrWhiteSpace(result.Revision)
-                || result.Revision.Length > DefaultIdentifierLengthLimit)
-            {
-                throw new ExtensionEntityFilterProviderException("The extension filter provider returned a missing or oversized revision.");
-            }
-            if (revisionInitialized
-                && !string.Equals(criterionRevision, result.Revision, StringComparison.Ordinal))
-            {
-                throw new ExtensionEntityFilterProviderException("The extension filter provider revision changed while evaluating the query.");
-            }
-
-            revisionInitialized = true;
-            criterionRevision = result.Revision;
-
-            nextMatches.UnionWith(result.MatchingEntityIds);
+            results = await _batchExecutor.ExecuteAsync<int, ExtensionEntityFilterRequest, ExtensionEntityFilterResult>(
+                candidates,
+                execution.ResolveAsync,
+                batch => new ExtensionEntityFilterRequest(
+                    declaration.ExtensionId,
+                    NormalizeEntityType(declaration.EntityType),
+                    declaration.FilterId!,
+                    NormalizeModifier(criterion.Modifier),
+                    criterion.Value,
+                    batch,
+                    principalContext),
+                result => result?.Revision,
+                static (batch, result) =>
+                {
+                    if (result?.MatchingEntityIds is null
+                        || result.MatchingEntityIds.Count > batch.Count
+                        || result.MatchingEntityIds.Any(id => !batch.Contains(id)))
+                    {
+                        throw new ExtensionEntityFilterProviderException(
+                            "The extension filter provider returned an invalid or oversized membership result.");
+                    }
+                },
+                remaining,
+                queryDeadline.Token,
+                ct);
+        }
+        catch (ExtensionContributionTimeoutException)
+        {
+            throw new ExtensionEntityFilterProviderException("The extension filter provider timed out.");
+        }
+        catch (ExtensionContributionProviderException ex)
+        {
+            throw new ExtensionEntityFilterProviderException("The extension filter provider failed.", ex.InnerException ?? ex);
+        }
+        catch (ExtensionContributionResultException ex)
+        {
+            throw new ExtensionEntityFilterProviderException(ex.Message, ex);
         }
 
+        var nextMatches = results
+            .SelectMany(result => result.MatchingEntityIds)
+            .ToHashSet();
         return candidates.Where(nextMatches.Contains).ToList();
     }
 
@@ -269,20 +243,6 @@ public sealed class ExtensionEntityFilterService
             var modifier => modifier,
         };
 
-    private static void ObserveLateProviderFailure(Task? providerTask)
-    {
-        if (providerTask is null || providerTask.IsCompleted)
-            return;
-
-        // Providers execute in-process and cannot be forcibly terminated. Observe a late fault so
-        // a provider that ignores cancellation cannot create an unobserved-task exception after the
-        // host has returned its bounded timeout response.
-        _ = providerTask.ContinueWith(
-            task => _ = task.Exception,
-            CancellationToken.None,
-            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
-            TaskScheduler.Default);
-    }
 }
 
 public sealed class ExtensionEntityFilterValidationException : Exception

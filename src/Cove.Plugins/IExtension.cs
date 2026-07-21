@@ -140,14 +140,19 @@ public interface IUIExtension : IExtension
     UIManifest GetUIManifest();
 }
 
+/// <summary>Marker for extension-owned provider services resolved by their real host-stamped owner.</summary>
+public interface IExtensionContributionProvider { }
+
 /// <summary>
 /// Resolves extension-owned predicates against host-authorized entity candidates. Providers return
 /// only membership; Cove retains ownership of authorization, query composition, sorting and paging.
-/// Resolve callbacks must not invoke or await a lifecycle transition for their own extension because
-/// the host retains that lifecycle gate while pinning one declaration and provider generation across
-/// every batch of the criterion.
+/// Cove owner-keys contribution-provider registrations; extension services that also consume their
+/// implementation should inject its concrete type rather than this discovery interface.
+/// Resolve callbacks execute against the exact provider generation captured for the criterion and
+/// must observe cancellation. Disable or replacement may retire that generation concurrently, but
+/// the host keeps its provider scope alive until every in-flight callback has completed.
 /// </summary>
-public interface IExtensionEntityFilterProvider
+public interface IExtensionEntityFilterProvider : IExtensionContributionProvider
 {
     IReadOnlyCollection<ExtensionEntityFilterDefinition> Filters { get; }
     Task<ExtensionEntityFilterResult> ResolveAsync(ExtensionEntityFilterRequest request, CancellationToken ct);
@@ -174,6 +179,41 @@ public sealed record ExtensionEntityFilterRequest(
 public sealed record ExtensionEntityFilterResult(
     IReadOnlyCollection<int> MatchingEntityIds,
     string Revision);
+
+/// <summary>A namespaced contribution owned by one extension.</summary>
+internal sealed record ExtensionContributionKey(string ExtensionId, string ContributionId);
+
+/// <summary>
+/// A contribution binding captured from one exact extension/provider generation. The runtime owns
+/// the provider scope and keeps it alive until all calls that were started through the execution
+/// have completed, including calls that outlive a host timeout.
+/// </summary>
+internal sealed record ExtensionContributionBinding<TDeclaration, TRequest, TResult>(
+    TDeclaration Declaration,
+    Func<TRequest, CancellationToken, Task<TResult>> ExecuteAsync);
+
+/// <summary>An exact-generation contribution execution.</summary>
+internal interface IExtensionContributionExecution<TDeclaration, TRequest, TResult> : IDisposable
+{
+    ExtensionContributionKey Key { get; }
+    TDeclaration Declaration { get; }
+    Task<TResult> ExecuteAsync(TRequest request, CancellationToken ct);
+}
+
+/// <summary>
+/// Host runtime for acquiring namespaced extension contributions. Implementations resolve and pin
+/// the exact provider generation under the owner's lifecycle gate, then release that gate before
+/// returning the execution.
+/// </summary>
+internal interface IExtensionContributionRuntime
+{
+    Task<IExtensionContributionExecution<TDeclaration, TRequest, TResult>?>
+        OpenContributionAsync<TDeclaration, TRequest, TResult>(
+        string extensionId,
+        string contributionId,
+        Func<IExtension, IServiceProvider, string, ExtensionContributionBinding<TDeclaration, TRequest, TResult>?> bind,
+        CancellationToken ct);
+}
 
 /// <summary>
 /// One owner-stamped filter declaration and exact provider generation captured for a criterion.

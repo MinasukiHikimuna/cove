@@ -15,7 +15,7 @@ namespace Cove.Plugins;
 /// Manages extension discovery, loading, dependency resolution, lifecycle,
 /// migrations, and capability wiring. This is the heart of the Cove extension system.
 /// </summary>
-public class ExtensionManager : IExtensionEntityFilterRuntime
+public class ExtensionManager : IExtensionContributionRuntime
 {
     private readonly object _extensionRegistryGate = new();
     private readonly object _extensionSetMutationGate = new();
@@ -682,7 +682,12 @@ public class ExtensionManager : IExtensionEntityFilterRuntime
 
             try
             {
+                var contributionStartIndex = services.Count;
                 ext.ConfigureServices(services, _context);
+                ExtensionContributionServiceRegistration.KeyProvidersAddedSince(
+                    services,
+                    contributionStartIndex,
+                    ext.Id);
             }
             catch (Exception ex)
             {
@@ -734,12 +739,12 @@ public class ExtensionManager : IExtensionEntityFilterRuntime
 
         // The container is being (re)built: stop any running worker and clear stale contributions so the
         // extension re-publishes against the new container on init.
-        StopBackgroundWorker(id);
-        WithdrawFromExchange(id);
+        StopBackgroundWorker(ext.Id);
+        WithdrawFromExchange(ext.Id);
 
         _overlay ??= new ExtensionServiceOverlay(_rootServices, _hostDescriptors, _logger);
         return _overlay.TryBuildProvider(
-            id,
+            ext.Id,
             ext,
             _context,
             (failedId, e) => DisableExtensionForStartupFailure(failedId, e, "provider build"));
@@ -1733,16 +1738,11 @@ public class ExtensionManager : IExtensionEntityFilterRuntime
             manifest.DialogOverrides.AddRange(extManifest.DialogOverrides.Select(dialogOverride => dialogOverride with { ExtensionId = ext.Id }));
             manifest.Actions.AddRange(extManifest.Actions.Select(action => action with { ExtensionId = ext.Id }));
             AddTutorialTopics(extManifest.TutorialTopics, ext.Id);
-            manifest.ListFilters.AddRange(extManifest.ListFilters
-                .Where(filter => string.IsNullOrWhiteSpace(filter.FilterId) || IsSupportedExecutableFilterEntity(filter.EntityType))
-                .Select(filter => string.IsNullOrWhiteSpace(filter.FilterId)
-                    ? filter with { ExtensionId = ext.Id }
-                    : filter with
-                    {
-                        ExtensionId = ext.Id,
-                        EntityType = "tags",
-                        FilterId = filter.FilterId.Trim(),
-                    }));
+            manifest.ListFilters.AddRange(extManifest.ListFilters.Select(filter => filter with
+            {
+                ExtensionId = ext.Id,
+                FilterId = string.IsNullOrWhiteSpace(filter.FilterId) ? null : filter.FilterId.Trim(),
+            }));
             manifest.ListSorts.AddRange(extManifest.ListSorts.Select(sort => sort with { ExtensionId = ext.Id }));
         }
 
@@ -1791,68 +1791,55 @@ public class ExtensionManager : IExtensionEntityFilterRuntime
         return manifest;
     }
 
-    private static bool IsSupportedExecutableFilterEntity(string entityType)
-        => string.Equals(entityType?.Trim(), "tags", StringComparison.OrdinalIgnoreCase);
-
     /// <summary>
-    /// Capture one declaration and provider generation for every batch of a criterion. The returned
-    /// execution owns an extension scope whose generation remains alive through replacement or
-    /// disable, and defers scope disposal while timed-out provider work is still running.
+    /// Resolve a namespaced contribution and atomically acquire its exact provider generation while
+    /// holding the owner's lifecycle gate. The gate is released before this method returns; the
+    /// returned execution alone pins the retired generation until its in-flight calls drain.
     /// </summary>
-    public async Task<IExtensionEntityFilterExecution?> OpenEntityFilterAsync(
+    async Task<IExtensionContributionExecution<TDeclaration, TRequest, TResult>?>
+        IExtensionContributionRuntime.OpenContributionAsync<TDeclaration, TRequest, TResult>(
         string extensionId,
-        string entityType,
-        string filterId,
+        string contributionId,
+        Func<IExtension, IServiceProvider, string, ExtensionContributionBinding<TDeclaration, TRequest, TResult>?> bind,
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(extensionId)
-            || string.IsNullOrWhiteSpace(entityType)
-            || string.IsNullOrWhiteSpace(filterId)
-            || !IsSupportedExecutableFilterEntity(entityType))
+            || string.IsNullOrWhiteSpace(contributionId))
+            return null;
+        ArgumentNullException.ThrowIfNull(bind);
+
+        var normalizedExtensionId = extensionId.Trim();
+        var normalizedContributionId = contributionId.Trim();
+        if (normalizedExtensionId.Length > 256 || normalizedContributionId.Length > 256)
             return null;
 
-        var lifecycleGate = GetExtensionLifecycleGate(extensionId);
+        var lifecycleGate = GetExtensionLifecycleGate(normalizedExtensionId);
         await lifecycleGate.WaitAsync(ct);
-        var releaseLifecycleGate = true;
         IServiceScope? provisionalScope = null;
         try
         {
-            if (!IsEnabled(extensionId)
-                || !IsExtensionInitialized(extensionId)
-                || GetExtension(extensionId) is not { } extension
-                || extension is not IUIExtension uiExtension)
+            if (!IsEnabled(normalizedExtensionId)
+                || !IsExtensionInitialized(normalizedExtensionId)
+                || GetExtension(normalizedExtensionId) is not { } extension)
                 return null;
 
-            var declaration = ExecuteExtension(extension, uiExtension.GetUIManifest).ListFilters
-                .Where(filter => !string.IsNullOrWhiteSpace(filter.FilterId))
-                .FirstOrDefault(filter =>
-                    string.Equals(filter.EntityType.Trim(), entityType.Trim(), StringComparison.OrdinalIgnoreCase)
-                    && string.Equals(filter.FilterId!.Trim(), filterId.Trim(), StringComparison.OrdinalIgnoreCase));
-            if (declaration is null)
-                return null;
-
+            // Scope acquisition atomically checks the extension instance and provider generation.
+            // Runtime extensions fail closed here; they never fall back to the host provider.
             provisionalScope = CreateExtensionScope(extension);
-            var provider = provisionalScope.ServiceProvider.GetServices<IExtensionEntityFilterProvider>()
-                .SingleOrDefault(candidate => candidate.Filters.Any(definition =>
-                    string.Equals(definition.FilterId.Trim(), filterId.Trim(), StringComparison.OrdinalIgnoreCase)
-                    && string.Equals(definition.EntityType.Trim(), entityType.Trim(), StringComparison.OrdinalIgnoreCase)));
-            if (provider is null)
+            var binding = bind(
+                extension,
+                provisionalScope.ServiceProvider,
+                normalizedContributionId);
+            if (binding is null)
                 return null;
 
-            var ownedDeclaration = declaration with
-            {
-                ExtensionId = extension.Id,
-                EntityType = "tags",
-                FilterId = declaration.FilterId!.Trim(),
-            };
             var ownedScope = provisionalScope;
             provisionalScope = null;
-            releaseLifecycleGate = false;
-            return new ExtensionEntityFilterExecution(
-                ownedDeclaration,
-                provider,
-                ownedScope,
-                () => lifecycleGate.Release());
+            return new ExtensionContributionExecution<TDeclaration, TRequest, TResult>(
+                new ExtensionContributionKey(extension.Id, normalizedContributionId),
+                binding.Declaration,
+                binding.ExecuteAsync,
+                ownedScope);
         }
         finally
         {
@@ -1862,28 +1849,26 @@ public class ExtensionManager : IExtensionEntityFilterRuntime
             }
             finally
             {
-                if (releaseLifecycleGate)
-                    lifecycleGate.Release();
+                lifecycleGate.Release();
             }
         }
     }
 
-    private sealed class ExtensionEntityFilterExecution(
-        UIListFilterContribution declaration,
-        IExtensionEntityFilterProvider provider,
-        IServiceScope scope,
-        Action releaseLifecycleGate) : IExtensionEntityFilterExecution
+    private sealed class ExtensionContributionExecution<TDeclaration, TRequest, TResult>(
+        ExtensionContributionKey key,
+        TDeclaration declaration,
+        Func<TRequest, CancellationToken, Task<TResult>> execute,
+        IServiceScope scope) : IExtensionContributionExecution<TDeclaration, TRequest, TResult>
     {
         private readonly object _gate = new();
         private IServiceScope? _scope = scope;
         private int _activeCalls;
         private bool _disposeRequested;
 
-        public UIListFilterContribution Declaration { get; } = declaration;
+        public ExtensionContributionKey Key { get; } = key;
+        public TDeclaration Declaration { get; } = declaration;
 
-        public Task<ExtensionEntityFilterResult> ResolveAsync(
-            ExtensionEntityFilterRequest request,
-            CancellationToken ct)
+        public Task<TResult> ExecuteAsync(TRequest request, CancellationToken ct)
         {
             lock (_gate)
             {
@@ -1891,10 +1876,10 @@ public class ExtensionManager : IExtensionEntityFilterRuntime
                 _activeCalls++;
             }
 
-            Task<ExtensionEntityFilterResult> task;
+            Task<TResult> task;
             try
             {
-                task = provider.ResolveAsync(request, ct);
+                task = execute(request, ct);
             }
             catch
             {
@@ -1923,8 +1908,7 @@ public class ExtensionManager : IExtensionEntityFilterRuntime
             ReleaseResources(dispose);
         }
 
-        private async Task<ExtensionEntityFilterResult> AwaitAndReleaseAsync(
-            Task<ExtensionEntityFilterResult> task)
+        private async Task<TResult> AwaitAndReleaseAsync(Task<TResult> task)
         {
             try
             {
@@ -1953,17 +1937,7 @@ public class ExtensionManager : IExtensionEntityFilterRuntime
 
         private void ReleaseResources(IServiceScope? dispose)
         {
-            if (dispose is null)
-                return;
-
-            try
-            {
-                dispose.Dispose();
-            }
-            finally
-            {
-                releaseLifecycleGate();
-            }
+            dispose?.Dispose();
         }
     }
 

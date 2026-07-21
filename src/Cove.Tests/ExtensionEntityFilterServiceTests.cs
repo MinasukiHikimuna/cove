@@ -25,7 +25,7 @@ public sealed class ExtensionEntityFilterServiceTests
         var runtime = new FakeRuntime(
             new UIListFilterContribution("preview", "tags", "Animated preview", "boolean", "spoofed", Modifiers: ["equals"]) { FilterId = "has-preview" },
             request => new ExtensionEntityFilterResult(request.CandidateIds.Where(id => id % 2 == 0).ToArray(), "revision-1"));
-        var service = new ExtensionEntityFilterService(runtime, batchSize: 2, candidateLimit: 5);
+        var service = new ExtensionEntityFilterService(runtime, batchSize: 2);
 
         var result = await service.ApplyAsync(
             "tags",
@@ -54,7 +54,7 @@ public sealed class ExtensionEntityFilterServiceTests
         var runtime = new FakeRuntime(
             new UIListFilterContribution("preview", "tags", "Animated preview", "boolean", "owner.actual", Modifiers: ["equals"]) { FilterId = "has-preview" },
             request => new ExtensionEntityFilterResult(request.CandidateIds, "revision-1"));
-        var service = new ExtensionEntityFilterService(runtime, batchSize: 2, candidateLimit: 5);
+        var service = new ExtensionEntityFilterService(runtime, batchSize: 2);
 
         var criterion = new ExtensionFilterCriterion
         {
@@ -92,15 +92,32 @@ public sealed class ExtensionEntityFilterServiceTests
     }
 
     [Fact]
-    public async Task ApplyAsync_rejects_candidate_and_provider_result_limits()
+    public async Task ApplyAsync_does_not_impose_a_global_candidate_limit()
+    {
+        var runtime = new FakeRuntime(
+            new UIListFilterContribution("preview", "tags", "Animated preview", "boolean", "owner.actual", Modifiers: ["equals"]) { FilterId = "has-preview" },
+            request => new ExtensionEntityFilterResult(request.CandidateIds, "revision-1"));
+        var service = new ExtensionEntityFilterService(runtime);
+        var candidates = Enumerable.Range(1, 5_001).ToArray();
+
+        var result = await service.ApplyAsync(
+            "tags",
+            [Criterion("owner.actual", "has-preview", true)],
+            candidates,
+            CovePrincipal.System(),
+            default);
+
+        Assert.Equal(candidates, result);
+    }
+
+    [Fact]
+    public async Task ApplyAsync_rejects_provider_result_and_criteria_limits()
     {
         var runtime = new FakeRuntime(
             new UIListFilterContribution("preview", "tags", "Animated preview", "boolean", "owner.actual", Modifiers: ["equals"]) { FilterId = "has-preview" },
             _ => new ExtensionEntityFilterResult([999], "revision-1"));
-        var service = new ExtensionEntityFilterService(runtime, batchSize: 2, candidateLimit: 2);
+        var service = new ExtensionEntityFilterService(runtime, batchSize: 2);
 
-        await Assert.ThrowsAsync<ExtensionEntityFilterLimitException>(() =>
-            service.ApplyAsync("tags", [Criterion("owner.actual", "has-preview", true)], [1, 2, 3], CovePrincipal.System(), default));
         await Assert.ThrowsAsync<ExtensionEntityFilterProviderException>(() =>
             service.ApplyAsync("tags", [Criterion("owner.actual", "has-preview", true)], [1, 2], CovePrincipal.System(), default));
         await Assert.ThrowsAsync<ExtensionEntityFilterLimitException>(() =>
@@ -136,6 +153,20 @@ public sealed class ExtensionEntityFilterServiceTests
             service.ApplyAsync("tags", [Criterion("owner.actual", "has-preview", true)], [1], CovePrincipal.System(), default));
 
         Assert.Equal("The extension filter provider failed.", error.Message);
+    }
+
+    [Fact]
+    public async Task ApplyAsync_converts_null_provider_results_to_bounded_errors()
+    {
+        var runtime = new FakeRuntime(
+            new UIListFilterContribution("preview", "tags", "Animated preview", "boolean", "owner.actual", Modifiers: ["equals"]) { FilterId = "has-preview" },
+            _ => null!);
+        var service = new ExtensionEntityFilterService(runtime);
+
+        var error = await Assert.ThrowsAsync<ExtensionEntityFilterProviderException>(() =>
+            service.ApplyAsync("tags", [Criterion("owner.actual", "has-preview", true)], [1], CovePrincipal.System(), default));
+
+        Assert.Contains("revision", error.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -182,6 +213,48 @@ public sealed class ExtensionEntityFilterServiceTests
         Assert.Equal(2, page.TotalCount);
         Assert.Equal(2, page.Page);
         Assert.Equal("Beta", Assert.Single(page.Items).Name);
+    }
+
+    [Fact]
+    public async Task Tags_find_keeps_the_candidate_limit_at_its_query_planning_boundary()
+    {
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<CoveContext>().UseSqlite(connection).Options;
+        await using var db = new CoveContext(options);
+        await db.Database.EnsureCreatedAsync();
+        var tags = Enumerable.Range(1, 5_001)
+            .Select(id => new Tag { Id = id, Name = $"Tag {id}" })
+            .ToArray();
+        var runtime = new FakeRuntime(
+            new UIListFilterContribution("preview", "tags", "Animated preview", "boolean", "owner.actual", Modifiers: ["equals"]) { FilterId = "has-preview" },
+            request => new ExtensionEntityFilterResult(request.CandidateIds, "revision-1"));
+        var accessor = new CurrentPrincipalAccessor();
+        accessor.Set(CovePrincipal.System());
+        var controller = new TagsController(
+            new PagedTagRepository(tags),
+            db,
+            new CustomFieldService(db),
+            null!,
+            extensionFilters: new ExtensionEntityFilterService(runtime),
+            principalAccessor: accessor)
+        {
+            ControllerContext = new ControllerContext { HttpContext = new DefaultHttpContext() },
+        };
+
+        var response = await controller.FindPost(new FilteredQueryRequest<TagFilter>
+        {
+            FindFilter = new FindFilter { Page = 1, PerPage = 25 },
+            ObjectFilter = new TagFilter
+            {
+                ExtensionCriteria = [Criterion("owner.actual", "has-preview", true)],
+            },
+        }, default);
+
+        var invalid = Assert.IsType<UnprocessableEntityObjectResult>(response.Result);
+        var problem = Assert.IsType<ProblemDetails>(invalid.Value);
+        Assert.Contains("5000", problem.Detail, StringComparison.Ordinal);
+        Assert.Empty(runtime.Requests);
     }
 
     [Fact]
