@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -10,7 +10,7 @@ interface OverrideRendererCall {
 
 const { overrideRendererCalls, overrideRenderState } = vi.hoisted(() => ({
   overrideRendererCalls: [] as OverrideRendererCall[],
-  overrideRenderState: { replace: false, active: false },
+  overrideRenderState: { replace: false, active: false, aspectRatio: null as string | null },
 }));
 
 vi.mock("../extensions/ExtensionLoader", () => ({
@@ -20,7 +20,7 @@ vi.mock("../extensions/ExtensionLoader", () => ({
   ExtensionComponentOverrideRenderer: (props: OverrideRendererCall) => {
     overrideRendererCalls.push(props);
     return overrideRenderState.replace
-      ? <div data-testid="extension-media">Extension media</div>
+      ? <div data-testid="extension-media" data-entity-media-aspect-ratio={overrideRenderState.aspectRatio ?? undefined}>Extension media</div>
       : props.renderDefault();
   },
 }));
@@ -33,6 +33,7 @@ describe("EntityMedia", () => {
     overrideRendererCalls.length = 0;
     overrideRenderState.replace = false;
     overrideRenderState.active = false;
+    overrideRenderState.aspectRatio = null;
   });
 
   it("routes the stable entity media contract through the entity.media override target", () => {
@@ -169,6 +170,24 @@ describe("EntityMedia", () => {
       fit: "cover",
       loading: "lazy",
       className: "h-full w-full",
+    });
+  });
+
+  it("sizes extension hover media from its declared aspect ratio", async () => {
+    overrideRenderState.active = true;
+    overrideRenderState.replace = true;
+    overrideRenderState.aspectRatio = "1:1";
+
+    render(
+      <EntityMediaHover entityType="tag" entityId={17} imageUrl={null} alt="Square preview" fit="cover">
+        <button type="button">Tag reference</button>
+      </EntityMediaHover>,
+    );
+
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "Tag reference" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("tooltip", { name: "Media for Square preview" })).toHaveStyle({ aspectRatio: "1 / 1" });
     });
   });
 

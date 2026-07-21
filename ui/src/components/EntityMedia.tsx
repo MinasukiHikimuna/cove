@@ -38,6 +38,28 @@ interface EntityMediaPreviewProps extends Omit<EntityMediaRenderProps, "renderDe
   frameClassName?: string;
 }
 
+const DEFAULT_HOVER_ASPECT_RATIO = "4 / 3";
+
+/** Override roots may declare their intrinsic frame shape for host-owned hover layout. */
+function readDeclaredAspectRatio(container: HTMLElement | null) {
+  const raw = container
+    ?.querySelector<HTMLElement>("[data-entity-media-aspect-ratio]")
+    ?.dataset.entityMediaAspectRatio;
+  const match = raw?.match(/^\s*(\d+(?:\.\d+)?)\s*[:/]\s*(\d+(?:\.\d+)?)\s*$/);
+  if (!match) return DEFAULT_HOVER_ASPECT_RATIO;
+
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  return Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0
+    ? `${width} / ${height}`
+    : DEFAULT_HOVER_ASPECT_RATIO;
+}
+
+function aspectRatioValue(aspectRatio: string) {
+  const [width, height] = aspectRatio.split("/").map(Number);
+  return width / height;
+}
+
 export type TagMediaReference = Pick<Tag, "id" | "name"> & Partial<Pick<Tag, "imagePath" | "hasImage">>;
 
 export function getTagMediaImageUrl(tag: TagMediaReference) {
@@ -142,9 +164,28 @@ export function EntityMediaPreview({ frameClassName, ...componentProps }: Entity
  */
 export function EntityMediaHover({ children, wrapperClassName = "inline-flex", ...mediaProps }: EntityMediaHoverProps) {
   const anchorRef = useRef<HTMLSpanElement>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const [position, setPosition] = useState({ left: 8, top: 8 });
+  const [aspectRatio, setAspectRatio] = useState(DEFAULT_HOVER_ASPECT_RATIO);
   const preview = useEntityMediaPreview({ ...mediaProps, surface: "hover", className: "h-full w-full" });
+
+  useLayoutEffect(() => {
+    if (!preview.enabled || !open) return;
+
+    const tooltip = tooltipRef.current;
+    const updateAspectRatio = () => {
+      const next = readDeclaredAspectRatio(tooltip);
+      setAspectRatio((current) => current === next ? current : next);
+    };
+
+    updateAspectRatio();
+    if (!tooltip) return;
+
+    const observer = new MutationObserver(updateAspectRatio);
+    observer.observe(tooltip, { attributes: true, attributeFilter: ["data-entity-media-aspect-ratio"], childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [preview.enabled, open]);
 
   useLayoutEffect(() => {
     if (!preview.enabled || !open) return;
@@ -152,8 +193,8 @@ export function EntityMediaHover({ children, wrapperClassName = "inline-flex", .
     const place = () => {
       const anchor = anchorRef.current?.getBoundingClientRect();
       if (!anchor) return;
-      const width = 288;
-      const height = 216;
+      const width = tooltipRef.current?.getBoundingClientRect().width || 288;
+      const height = width / aspectRatioValue(aspectRatio);
       const margin = 8;
       const left = Math.min(Math.max(margin, anchor.left), window.innerWidth - width - margin);
       const top = anchor.top - height - margin >= margin
@@ -169,7 +210,7 @@ export function EntityMediaHover({ children, wrapperClassName = "inline-flex", .
       window.removeEventListener("resize", place);
       window.removeEventListener("scroll", place, true);
     };
-  }, [preview.enabled, open]);
+  }, [aspectRatio, preview.enabled, open]);
 
   if (!preview.enabled) return <>{children}</>;
 
@@ -187,10 +228,11 @@ export function EntityMediaHover({ children, wrapperClassName = "inline-flex", .
       {children}
       {open && typeof document !== "undefined" ? createPortal(
         <div
+          ref={tooltipRef}
           role="tooltip"
           aria-label={`Media for ${mediaProps.alt}`}
-          className="pointer-events-none fixed z-[10000] block aspect-[4/3] w-72 overflow-hidden rounded-xl border border-border bg-surface/95 shadow-2xl empty:hidden"
-          style={position}
+          className="pointer-events-none fixed z-[10000] block w-72 overflow-hidden rounded-xl border border-border bg-surface/95 shadow-2xl empty:hidden"
+          style={{ ...position, aspectRatio }}
         >
           {preview.render()}
         </div>,
