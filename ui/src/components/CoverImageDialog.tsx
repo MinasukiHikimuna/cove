@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { ImageIcon, X } from "lucide-react";
 import { ImageInput } from "./ImageInput";
 import { ExtensionSlot } from "../router/RouteRegistry";
-import { ENTITY_COVER_EDITOR_SLOT, type EntityCoverEditorContext } from "../../../sdk/frontend/src/types";
+import { ENTITY_COVER_EDITOR_SLOT, type EntityCoverEditorContext } from "./EntityCoverEditorExtension";
 
 interface CoverImageDialogProps {
   open: boolean;

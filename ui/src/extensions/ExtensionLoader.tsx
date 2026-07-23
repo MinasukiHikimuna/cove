@@ -633,7 +633,6 @@ export function ExtensionLoaderProvider({ children, importBundle = defaultImport
     }
 
     for (const slot of manifest.slots ?? []) {
-      if (!canAccessExtensionContribution(slot, hasPermission)) continue;
       if (slot.contentType === "html" && slot.html) {
         unregisterSlots.push(registerSlot({
           id: slot.id,
@@ -670,7 +669,7 @@ export function ExtensionLoaderProvider({ children, importBundle = defaultImport
         unregisterContributions();
       }
     };
-  }, [getExtensionRevision, hasPermission, manifest, register, registerSlot, resolveComponent, troubleshootingMode]);
+  }, [getExtensionRevision, manifest, register, registerSlot, resolveComponent, troubleshootingMode, user]);
 
   // Apply active theme CSS variables and bundled component style
   useEffect(() => {
