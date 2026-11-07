@@ -99,7 +99,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        threads: ['default', '2x']
+        threads: ['default']
     steps:
       - name: Runner resources
         run: |
@@ -166,14 +166,19 @@ jobs:
           }
 
   api-tests:
-    name: api-tests (workers=${{ matrix.workers }})
+    name: api-tests (${{ matrix.shard }}, workers=${{ matrix.workers }})
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.backend == 'true') }}
     runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
-        workers: ['default', '3', '4']
+        include:
+          - { shard: full, workers: default, filter: '' }
+          - { shard: a, workers: default, filter: 'FullyQualifiedName~Cove.ApiTests.Tests.Entities.|FullyQualifiedName~Cove.ApiTests.Tests.Interactions.|FullyQualifiedName~Cove.ApiTests.Tests.Contracts.|FullyQualifiedName~Cove.ApiTests.Tests.Filters.|FullyQualifiedName~Cove.ApiTests.Tests.Extensions.|FullyQualifiedName~Cove.ApiTests.Tests.Files.' }
+          - { shard: b, workers: default, filter: 'FullyQualifiedName!~Cove.ApiTests.Tests.Entities.&FullyQualifiedName!~Cove.ApiTests.Tests.Interactions.&FullyQualifiedName!~Cove.ApiTests.Tests.Contracts.&FullyQualifiedName!~Cove.ApiTests.Tests.Filters.&FullyQualifiedName!~Cove.ApiTests.Tests.Extensions.&FullyQualifiedName!~Cove.ApiTests.Tests.Files.' }
+          - { shard: a, workers: '3', filter: 'FullyQualifiedName~Cove.ApiTests.Tests.Entities.|FullyQualifiedName~Cove.ApiTests.Tests.Interactions.|FullyQualifiedName~Cove.ApiTests.Tests.Contracts.|FullyQualifiedName~Cove.ApiTests.Tests.Filters.|FullyQualifiedName~Cove.ApiTests.Tests.Extensions.|FullyQualifiedName~Cove.ApiTests.Tests.Files.' }
+          - { shard: b, workers: '3', filter: 'FullyQualifiedName!~Cove.ApiTests.Tests.Entities.&FullyQualifiedName!~Cove.ApiTests.Tests.Interactions.&FullyQualifiedName!~Cove.ApiTests.Tests.Contracts.&FullyQualifiedName!~Cove.ApiTests.Tests.Filters.&FullyQualifiedName!~Cove.ApiTests.Tests.Extensions.&FullyQualifiedName!~Cove.ApiTests.Tests.Files.' }
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -247,12 +252,13 @@ jobs:
           dotnet test src/Cove.ApiTests/Cove.ApiTests.csproj
           -c Release --no-restore --no-build --verbosity normal
           --logger "trx;LogFileName=api-tests.trx" --results-directory artifacts/trx
+          ${{ matrix.filter != '' && format('--filter "{0}"', matrix.filter) || '' }}
 
       - name: Upload TRX
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: trx-api-${{ matrix.workers }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: trx-api-${{ matrix.shard }}-${{ matrix.workers }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: artifacts/trx
 
       - name: Test (Fluent API with coverage)
